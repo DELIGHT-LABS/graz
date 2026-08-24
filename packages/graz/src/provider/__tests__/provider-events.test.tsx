@@ -305,18 +305,34 @@ describe("provider components and events", () => {
         getAll: vi.fn(() => [
           {
             expiry: Math.floor(Date.now() / 1000) + 60,
+            namespaces: {
+              cosmos: {
+                accounts: ["cosmos:osmosis-1:osmo1unrelated"],
+                chains: ["cosmos:osmosis-1"],
+                events: ["accountsChanged"],
+                methods: ["cosmos_getAccounts"],
+              },
+            },
             requiredNamespaces: {
               cosmos: {
-                chains: ["cosmos:osmosis-1"],
+                chains: [`cosmos:${chain.chainId}`],
               },
             },
             topic: "unrelated-topic",
           },
           {
             expiry: Math.floor(Date.now() / 1000) + 60,
+            namespaces: {
+              cosmos: {
+                accounts: [`cosmos:${chain.chainId}:${bech32Address}`],
+                chains: [`cosmos:${chain.chainId}`],
+                events: ["accountsChanged"],
+                methods: ["cosmos_getAccounts"],
+              },
+            },
             requiredNamespaces: {
               cosmos: {
-                chains: [`cosmos:${chain.chainId}`],
+                chains: ["cosmos:osmosis-1"],
               },
             },
             sessionProperties: {
@@ -424,9 +440,7 @@ describe("provider components and events", () => {
     await act(async () => {
       signClient.events.emit(
         sessionEvent,
-        sessionEvent === "session_delete"
-          ? { id: 4, topic: "unrelated-topic" }
-          : { topic: "unrelated-topic" },
+        sessionEvent === "session_delete" ? { id: 4, topic: "unrelated-topic" } : { topic: "unrelated-topic" },
       );
       await Promise.resolve();
     });
@@ -509,9 +523,7 @@ describe("provider components and events", () => {
 
     const rendered = renderComponent(<GrazEvents />);
     await flushReact();
-    const keplrSubscriptions = addEventListener.mock.calls.filter(
-      ([event]) => event === "keplr_keystorechange",
-    );
+    const keplrSubscriptions = addEventListener.mock.calls.filter(([event]) => event === "keplr_keystorechange");
 
     await act(async () => {
       useGrazInternalStore.setState({

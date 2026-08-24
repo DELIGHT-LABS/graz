@@ -10,6 +10,7 @@ import { getLogger } from "../utils/logger";
 import { RECONNECT_SESSION_KEY } from "../constant";
 import { useGrazInternalStore, useGrazSessionStore } from "../store";
 import { WalletType } from "../types/wallet";
+import { findApprovedCosmosSession } from "../utils/wallet-connect-session";
 
 /**
  * Graz custom hook to track `keplr_keystorechange`, `accountChanged` event and reconnect state
@@ -101,13 +102,19 @@ export const useGrazEvents = () => {
     if (_reconnectConnector) {
       if (!isReconnectConnectorReady) return;
       if (isSessionActive && Boolean(activeChains)) {
-        logger.info(LogCategory.EVENT, "Reconnection triggered", { function: "reconnectEffect", reason: "session active" });
+        logger.info(LogCategory.EVENT, "Reconnection triggered", {
+          function: "reconnectEffect",
+          reason: "session active",
+        });
         void reconnect({
           onError: _onReconnectFailed,
         });
         // only reconnect if session is active and autoReconnect from grazOptions is true
       } else if (!isSessionActive && _reconnect) {
-        logger.info(LogCategory.EVENT, "Reconnection triggered", { function: "reconnectEffect", reason: "auto-reconnect enabled" });
+        logger.info(LogCategory.EVENT, "Reconnection triggered", {
+          function: "reconnectEffect",
+          reason: "auto-reconnect enabled",
+        });
         void reconnect({
           onError: _onReconnectFailed,
         });
@@ -129,21 +136,7 @@ export const useGrazEvents = () => {
         const { recentChainIds } = useGrazInternalStore.getState();
         const connectedChainIds = activeChainIds || recentChainIds || [];
         const sessions = signClient.session.getAll();
-        const activeSession =
-          connectedChainIds.length > 0
-            ? [...sessions].reverse().find((session) => {
-                const namespace = session.namespaces?.cosmos;
-                const sessionChainIds = [
-                  ...(session.requiredNamespaces.cosmos?.chains || []),
-                  ...(namespace?.chains || []),
-                  ...(namespace?.accounts || []).map((account) =>
-                    account.split(":").slice(0, 2).join(":"),
-                  ),
-                ].map((chainId) => chainId.split(":")[1]);
-
-                return connectedChainIds.some((chainId) => sessionChainIds.includes(chainId));
-              })
-            : sessions.at(-1);
+        const activeSession = findApprovedCosmosSession(sessions, connectedChainIds);
 
         return activeSession?.topic === topic;
       };
@@ -185,7 +178,6 @@ export const useGrazEvents = () => {
       });
       void reconnect({ onError: _onReconnectFailed });
     });
-
   }, [_onReconnectFailed, _reconnectConnector, isReconnectConnectorReady, logger, wcSignClients]);
 
   return null;

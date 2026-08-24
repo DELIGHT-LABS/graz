@@ -21,8 +21,15 @@ const makeWalletConnectKey = (chainId: string, overrides: Partial<Key> = {}) => 
 
 const makeSignClient = (
   chainId: string,
-  options: { includeSessionProperties?: boolean; sessionPropertiesChainId?: string } = {},
+  options: {
+    approvedChainIds?: string[];
+    approvedMethods?: string[];
+    includeSessionProperties?: boolean;
+    sessionPropertiesChainId?: string;
+  } = {},
 ) => {
+  const approvedChainIds = options.approvedChainIds ?? [chainId];
+  const approvedMethods = options.approvedMethods ?? ["cosmos_getAccounts", "cosmos_signAmino", "cosmos_signDirect"];
   const includeSessionProperties = options.includeSessionProperties ?? true;
   const sessionPropertiesChainId = options.sessionPropertiesChainId ?? chainId;
   const listeners = new Map<string, Set<(args?: unknown) => void>>();
@@ -30,7 +37,15 @@ const makeSignClient = (
     expiry: Math.floor(Date.now() / 1000) + 60,
     requiredNamespaces: {
       cosmos: {
-        chains: [`cosmos:${chainId}`],
+        chains: ["cosmos:proposal-only-1"],
+      },
+    },
+    namespaces: {
+      cosmos: {
+        accounts: approvedChainIds.map((approvedChainId) => `cosmos:${approvedChainId}:${approvedChainId}1address`),
+        chains: approvedChainIds.map((approvedChainId) => `cosmos:${approvedChainId}`),
+        events: ["accountsChanged", "chainChanged"],
+        methods: approvedMethods,
       },
     },
     ...(includeSessionProperties
@@ -94,6 +109,28 @@ const makeSignClient = (
             authInfoBytes: Buffer.from(new Uint8Array([1])).toString("base64"),
             bodyBytes: Buffer.from(new Uint8Array([2])).toString("base64"),
             chainId,
+          },
+        };
+      }
+      if (request.method === "cosmos_signAmino") {
+        return {
+          signature: {
+            pub_key: {
+              type: "tendermint/PubKeySecp256k1",
+              value: "pubkey",
+            },
+            signature: "signature",
+          },
+          signed: {
+            account_number: "7",
+            chain_id: chainId,
+            fee: {
+              amount: [],
+              gas: "0",
+            },
+            memo: "",
+            msgs: [],
+            sequence: "0",
           },
         };
       }
@@ -171,9 +208,7 @@ describe("WalletConnect adapter", () => {
 
     const directSigner = await wallet.getOfflineSignerAuto(chainId);
     expect("signDirect" in directSigner).toBe(true);
-    await expect(
-      wallet.getOfflineSigner(chainId).getAccounts(),
-    ).resolves.toEqual([
+    await expect(wallet.getOfflineSigner(chainId).getAccounts()).resolves.toEqual([
       {
         address: `${chainId}1address`,
         algo: "secp256k1",
@@ -200,6 +235,32 @@ describe("WalletConnect adapter", () => {
         chainId: `cosmos:${chainId}`,
         request: expect.objectContaining({
           method: "cosmos_signDirect",
+        }),
+        topic: "topic-1",
+      }),
+    );
+    await expect(
+      wallet.signAmino(chainId, `${chainId}1address`, {
+        account_number: "7",
+        chain_id: chainId,
+        fee: {
+          amount: [],
+          gas: "0",
+        },
+        memo: "",
+        msgs: [],
+        sequence: "0",
+      }),
+    ).resolves.toMatchObject({
+      signed: {
+        chain_id: chainId,
+      },
+    });
+    expect(signClient.request).toHaveBeenCalledWith(
+      expect.objectContaining({
+        chainId: `cosmos:${chainId}`,
+        request: expect.objectContaining({
+          method: "cosmos_signAmino",
         }),
         topic: "topic-1",
       }),
@@ -302,5 +363,72 @@ describe("WalletConnect adapter", () => {
       },
       topic: "topic-1",
     });
+  });
+
+  it("rejects signing methods and accounts outside the approved namespace", async () => {
+    const chainId = "cosmoshub-4";
+    const signClient = makeSignClient(chainId, {
+      approvedMethods: ["cosmos_getAccounts", "cosmos_signAmino"],
+    });
+    const wcSignClients = new Map();
+    wcSignClients.set(WalletType.WALLETCONNECT, signClient);
+    useGrazInternalStore.setState({
+      walletConnect: {
+        options: {
+          projectId: "project-id",
+        },
+      },
+    });
+    useGrazSessionStore.setState({
+      accounts: {
+        [chainId]: makeWalletConnectKey(chainId) as unknown as Key,
+      },
+      wcSignClients,
+    });
+
+    const wallet = getWalletConnect();
+    const signDoc = {
+      accountNumber: 7n,
+      authInfoBytes: new Uint8Array([1]),
+      bodyBytes: new Uint8Array([2]),
+      chainId,
+    };
+
+    await expect(wallet.signDirect(chainId, `${chainId}1address`, signDoc)).rejects.toThrow(
+      "No WalletConnect session approved for cosmos_signDirect",
+    );
+    await expect(
+      wallet.signAmino(chainId, "cosmos1not-approved", {
+        account_number: "7",
+        chain_id: chainId,
+        fee: { amount: [], gas: "0" },
+        memo: "",
+        msgs: [],
+        sequence: "0",
+      }),
+    ).rejects.toThrow("does not approve account cosmos1not-approved");
+  });
+
+  it("disconnects a shared multi-chain session topic only once", async () => {
+    const chainId = "cosmoshub-4";
+    const signClient = makeSignClient(chainId, {
+      approvedChainIds: [chainId, "osmosis-1"],
+    });
+    const wcSignClients = new Map();
+    wcSignClients.set(WalletType.WALLETCONNECT, signClient);
+    useGrazInternalStore.setState({
+      walletConnect: {
+        options: {
+          projectId: "project-id",
+        },
+      },
+    });
+    useGrazSessionStore.setState({ wcSignClients });
+
+    const disable = getWalletConnect().disable as ((chainIds: string[]) => Promise<void>) | undefined;
+    await disable?.([chainId, "osmosis-1"]);
+
+    expect(signClient.disconnect).toHaveBeenCalledTimes(1);
+    expect(signClient.disconnect).toHaveBeenCalledWith(expect.objectContaining({ topic: "topic-1" }));
   });
 });

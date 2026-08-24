@@ -54,6 +54,31 @@ const makeWalletConnectKey = (chainId: string): WalletConnectStoredKey => ({
 
 const getWalletConnectChainId = (chainId: string) => chainId.split(":")[1] || chainId;
 
+const makeApprovedSession = (keys: WalletConnectStoredKey[], includeSessionProperties = true) => ({
+  expiry: Math.floor(Date.now() / 1000) + 60,
+  namespaces: {
+    cosmos: {
+      accounts: keys.map((key) => `cosmos:${key.chainId}:${key.bech32Address}`),
+      chains: keys.map((key) => `cosmos:${key.chainId}`),
+      events: ["accountsChanged", "chainChanged"],
+      methods: ["cosmos_getAccounts", "cosmos_signAmino", "cosmos_signDirect"],
+    },
+  },
+  requiredNamespaces: {
+    cosmos: {
+      chains: ["cosmos:proposal-only-1"],
+    },
+  },
+  ...(includeSessionProperties
+    ? {
+        sessionProperties: {
+          keys: JSON.stringify(keys),
+        },
+      }
+    : {}),
+  topic: "topic-1",
+});
+
 describe("WalletConnect first-session flow", () => {
   beforeEach(() => {
     walletConnectModalMock.instances.length = 0;
@@ -69,11 +94,7 @@ describe("WalletConnect first-session flow", () => {
   it("opens the modal, approves a new session, and stores approved accounts", async () => {
     const cosmoshub = makeWalletConnectKey("cosmoshub-4");
     const osmosis = makeWalletConnectKey("osmosis-1");
-    const approval = vi.fn().mockResolvedValue({
-      sessionProperties: {
-        keys: JSON.stringify([cosmoshub, osmosis]),
-      },
-    });
+    const approval = vi.fn().mockResolvedValue(makeApprovedSession([cosmoshub, osmosis]));
     const signClient = {
       connect: vi.fn().mockResolvedValue({
         approval,
@@ -115,11 +136,7 @@ describe("WalletConnect first-session flow", () => {
 
   it("passes custom mobile and desktop wallet lists to the WalletConnect modal", async () => {
     const chainId = "cosmoshub-4";
-    const approval = vi.fn().mockResolvedValue({
-      sessionProperties: {
-        keys: JSON.stringify([makeWalletConnectKey(chainId)]),
-      },
-    });
+    const approval = vi.fn().mockResolvedValue(makeApprovedSession([makeWalletConnectKey(chainId)]));
     const signClient = {
       connect: vi.fn().mockResolvedValue({
         approval,
@@ -177,9 +194,7 @@ describe("WalletConnect first-session flow", () => {
 
   it("requests accounts when an approved session does not include session properties", async () => {
     const chainId = "cosmoshub-4";
-    const approval = vi.fn().mockResolvedValue({
-      topic: "topic-1",
-    });
+    const approval = vi.fn().mockResolvedValue(makeApprovedSession([makeWalletConnectKey(chainId)], false));
     const signClient = {
       connect: vi.fn().mockResolvedValue({
         approval,

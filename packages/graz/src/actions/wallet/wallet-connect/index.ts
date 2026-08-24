@@ -3,7 +3,7 @@ import type { AccountData, Algo, DirectSignResponse } from "@cosmjs/proto-signin
 import type { Keplr } from "@keplr-wallet/types";
 import { WalletConnectModal } from "@walletconnect/modal";
 import { SignClient } from "@walletconnect/sign-client";
-import type { ISignClient, SignClientTypes } from "@walletconnect/types";
+import type { ISignClient, SessionTypes, SignClientTypes } from "@walletconnect/types";
 import { getSdkError } from "@walletconnect/utils";
 
 import { useGrazInternalStore, useGrazSessionStore } from "../../../store";
@@ -11,8 +11,14 @@ import type { Key } from "../../../types/wallet";
 import { type SignAminoParams, type SignDirectParams, type Wallet, WalletType } from "../../../types/wallet";
 import { isAndroid, isIos, isMobile } from "../../../utils/os";
 import { promiseWithTimeout } from "../../../utils/timeout";
+import {
+  findApprovedCosmosSession,
+  getApprovedCosmosScope,
+  isApprovedCosmosAccount,
+  isWalletConnectSessionActive,
+  sessionApprovesCosmos,
+} from "../../../utils/wallet-connect-session";
 import type { GetWalletConnectParams, WalletConnectSignDirectResponse } from "./types";
-
 
 type WalletConnectStoredKey = Omit<Key, "pubKey"> & { chainId?: string; pubKey: Key["pubKey"] | string };
 
@@ -68,41 +74,26 @@ export const getWalletConnect = (params?: GetWalletConnectParams): Wallet => {
     await deleteInactivePairings(wcSignClient);
   };
 
-  const getSession = (chainId: string[]) => {
+  const getSession = (chainIds: string[], method?: string) => {
     try {
       const { wcSignClients } = useGrazSessionStore.getState();
       const wcSignClient = wcSignClients.get(walletType);
       if (!wcSignClient) throw new Error("walletConnect.signClient is not defined");
-      const allSession = wcSignClient.session.getAll();
-      const lastSession = allSession[allSession.length - 1];
-      if (!lastSession) return;
+      const sessions = wcSignClient.session.getAll();
 
-      const isValid = lastSession.expiry * 1000 > Date.now() + 1000;
-      if (!isValid) {
-        void wcDisconnect(lastSession.topic);
-        throw new Error("invalid session");
+      for (const session of sessions) {
+        if (!isWalletConnectSessionActive(session)) void wcDisconnect(session.topic);
       }
 
-      try {
-        const chainSession = allSession.find((x) => x.requiredNamespaces.cosmos?.chains?.includes(`cosmos:${chainId}`));
-        if (!chainSession) {
-          throw new Error("no session");
-        }
-        return chainSession;
-      } catch (error) {
-        if (!(error as Error).message.toLowerCase().includes("no matching key")) throw error;
-      }
-
-      return lastSession;
+      return findApprovedCosmosSession(sessions, chainIds, method);
     } catch (error) {
       if (!(error as Error).message.toLowerCase().includes("no matching key")) throw error;
     }
   };
 
-  const checkSession = (chainId: string[]) => {
+  const checkSession = (chainIds: string[]) => {
     try {
-      const lastSession = getSession(chainId);
-      return lastSession;
+      return getSession(chainIds);
     } catch (error) {
       return undefined;
     }
@@ -137,8 +128,27 @@ export const getWalletConnect = (params?: GetWalletConnectParams): Wallet => {
 
   const getWalletConnectChainId = (chainId?: string) => chainId?.split(":")[1] || chainId;
 
+  const filterApprovedKeys = (
+    session: SessionTypes.Struct,
+    chainIds: string[],
+    keys: WalletConnectStoredKey[],
+  ): WalletConnectStoredKey[] => {
+    const approvedAccounts = getApprovedCosmosScope(session).accounts.filter((account) =>
+      chainIds.includes(account.chainId),
+    );
+
+    return keys.flatMap((key) => {
+      const keyChainId = getWalletConnectChainId(key.chainId);
+      const approvedAccount = approvedAccounts.find(
+        (account) => (!keyChainId || account.chainId === keyChainId) && account.address === key.bech32Address,
+      );
+      return approvedAccount ? [{ ...key, chainId: approvedAccount.chainId }] : [];
+    });
+  };
+
   const requestAccounts = async (
     signClient: ISignClient,
+    session: SessionTypes.Struct,
     topic: string,
     chainIds: string[],
   ): Promise<WalletConnectStoredKey[]> => {
@@ -164,22 +174,27 @@ export const getWalletConnect = (params?: GetWalletConnectParams): Wallet => {
       }),
     );
 
-    return keysByChainId.flat();
+    return filterApprovedKeys(session, chainIds, keysByChainId.flat());
   };
 
   const getSessionKeys = async (
     signClient: ISignClient,
-    session: { sessionProperties?: Record<string, string>; topic?: string },
+    session: SessionTypes.Struct,
     chainIds: string[],
   ): Promise<WalletConnectStoredKey[]> => {
-    const keys = parseSessionKeys(session.sessionProperties)?.map((key) => ({
-      ...key,
-      chainId: getWalletConnectChainId(key.chainId),
-    }));
-    if (keys?.some((key) => key.chainId && chainIds.includes(key.chainId))) return keys;
-    if (!session.topic) throw new Error("No wallet connect session");
+    if (!sessionApprovesCosmos(session, chainIds)) {
+      throw new Error("WalletConnect session does not approve the requested chains");
+    }
 
-    return requestAccounts(signClient, session.topic, chainIds);
+    const storedKeys = filterApprovedKeys(session, chainIds, parseSessionKeys(session.sessionProperties) ?? []);
+    const missingChainIds = chainIds.filter((chainId) => !storedKeys.some((key) => key.chainId === chainId));
+    if (missingChainIds.length === 0) return storedKeys;
+    if (!session.topic) throw new Error("No wallet connect session");
+    if (!sessionApprovesCosmos(session, missingChainIds, "cosmos_getAccounts")) {
+      throw new Error("WalletConnect session does not approve cosmos_getAccounts");
+    }
+
+    return [...storedKeys, ...(await requestAccounts(signClient, session, session.topic, missingChainIds))];
   };
 
   const init = async () => {
@@ -199,7 +214,7 @@ export const getWalletConnect = (params?: GetWalletConnectParams): Wallet => {
   const subscription: (reconnect: () => void) => () => void = (reconnect) => {
     const { wcSignClients } = useGrazSessionStore.getState();
     const wcSignClient = wcSignClients.get(walletType);
-     
+
     if (!wcSignClient) return () => {};
 
     const sessionEventListener = (args: SignClientTypes.EventArguments["session_event"]) => {
@@ -209,7 +224,7 @@ export const getWalletConnect = (params?: GetWalletConnectParams): Wallet => {
         _accounts &&
         !Object.values(_accounts)
           .map((x) => x.bech32Address)
-           
+
           .includes(args.params.event.data[0])
       ) {
         const chainId = args.params.chainId.split(":")[1];
@@ -377,14 +392,17 @@ export const getWalletConnect = (params?: GetWalletConnectParams): Wallet => {
     if (!wcSignClient) throw new Error("walletConnect.signClient is not defined");
     if (!account) throw new Error("account is not defined");
 
-    const topic = getSession([chainId])?.topic;
-    if (!topic) throw new Error("No wallet connect session");
+    const session = getSession([chainId], "cosmos_signDirect");
+    if (!session?.topic) throw new Error("No WalletConnect session approved for cosmos_signDirect");
+    if (!isApprovedCosmosAccount(session, chainId, signer)) {
+      throw new Error(`WalletConnect session does not approve account ${signer} on ${chainId}`);
+    }
 
     if (!signDoc.bodyBytes) throw new Error("No bodyBytes");
     if (!signDoc.authInfoBytes) throw new Error("No authInfoBytes");
     redirectToApp();
     const result: WalletConnectSignDirectResponse = await wcSignClient.request({
-      topic,
+      topic: session.topic,
       chainId: `cosmos:${chainId}`,
       request: {
         method: "cosmos_signDirect",
@@ -426,15 +444,18 @@ export const getWalletConnect = (params?: GetWalletConnectParams): Wallet => {
     if (!wcSignClient) throw new Error("walletConnect.signClient is not defined");
     if (!account) throw new Error("account is not defined");
 
-    const topic = getSession([chainId])?.topic;
-    if (!topic) throw new Error("No wallet connect session");
+    const session = getSession([chainId], "cosmos_signAmino");
+    if (!session?.topic) throw new Error("No WalletConnect session approved for cosmos_signAmino");
+    if (!isApprovedCosmosAccount(session, chainId, signer)) {
+      throw new Error(`WalletConnect session does not approve account ${signer} on ${chainId}`);
+    }
 
     redirectToApp();
     const result: AminoSignResponse = await wcSignClient.request({
-      topic,
+      topic: session.topic,
       chainId: `cosmos:${chainId}`,
       request: {
-        method: "cosmos_signDirect",
+        method: "cosmos_signAmino",
         params: {
           signerAddress: signer,
           signDoc,
@@ -476,8 +497,18 @@ export const getWalletConnect = (params?: GetWalletConnectParams): Wallet => {
 
   const getOfflineSignerAuto = async (chainId: string) => {
     const key = await getKey(chainId);
-    if (key.isNanoLedger) return getOfflineSignerOnlyAmino(chainId);
-    return getOfflineSignerDirect(chainId);
+    const session = getSession([chainId]);
+    if (!session) throw new Error("No wallet connect session");
+    if (key.isNanoLedger && sessionApprovesCosmos(session, [chainId], "cosmos_signAmino")) {
+      return getOfflineSignerOnlyAmino(chainId);
+    }
+    if (sessionApprovesCosmos(session, [chainId], "cosmos_signDirect")) {
+      return getOfflineSignerDirect(chainId);
+    }
+    if (sessionApprovesCosmos(session, [chainId], "cosmos_signAmino")) {
+      return getOfflineSignerOnlyAmino(chainId);
+    }
+    throw new Error("WalletConnect session does not approve a supported signing method");
   };
 
   const experimentalSuggestChain = async (..._args: Parameters<Keplr["experimentalSuggestChain"]>) => {
@@ -493,10 +524,14 @@ export const getWalletConnect = (params?: GetWalletConnectParams): Wallet => {
       if (chainIds === undefined) {
         const sessions = signClient?.session.getAll();
         if (sessions !== undefined) await Promise.all(sessions.map((s) => wcDisconnect(s.topic)));
-      } else if (typeof chainIds === "string") {
-        await wcDisconnect(getSession([chainIds])?.topic);
       } else {
-        await Promise.all(chainIds.map((x) => wcDisconnect(getSession([x])?.topic)));
+        const requestedChainIds = typeof chainIds === "string" ? [chainIds] : chainIds;
+        const topics = new Set(
+          requestedChainIds
+            .map((chainId) => getSession([chainId])?.topic)
+            .filter((topic): topic is string => topic !== undefined),
+        );
+        await Promise.all([...topics].map(wcDisconnect));
       }
 
       // if no more sessions, remove signClient
